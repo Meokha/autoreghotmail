@@ -1,16 +1,25 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 import threading
 import random
 import time
 import asyncio
 import queue
+# pandas is optional for reading Excel files. Prefer pandas if available
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        load_workbook = None
 from datetime import datetime
 
 import botright
 import hcaptcha_challenger as solver
 from captcha_solver import warmup_account
-from db import fetch_pending_accounts, fetch_all_emails
+from db import fetch_pending_accounts, fetch_all_emails, update_warmup_status
 from hotmail_auto_simple import HotmailAccountCreator
 from playwright._impl._errors import TargetClosedError
 
@@ -38,6 +47,20 @@ class MultiHotmailGUI:
         self.warmup_active_workers = 0
         self.warmup_lock = threading.Lock()
         self.warmup_email_ring: list[str] = []
+        # Custom emails / proxies support
+        from collections import deque
+
+        self.custom_emails = deque()  # holds strings like 'local' or 'local@domain' or 'local@domain|proxy'
+        self.custom_emails_lock = threading.Lock()
+        self.use_custom_emails = tk.BooleanVar(value=False)
+
+        self.create_proxies: list[str] = []
+        self.create_proxy_index = 0
+        self.create_proxy_lock = threading.Lock()
+
+        self.warmup_proxies: list[str] = []
+        self.warmup_proxy_index = 0
+        self.warmup_proxy_lock = threading.Lock()
         self.create_widgets()
 
     def create_widgets(self):
@@ -74,6 +97,23 @@ class MultiHotmailGUI:
         self.domain_choice = ttk.Combobox(domain_frame, values=["random", "hotmail", "outlook"], state="readonly", width=10)
         self.domain_choice.set("random")
         self.domain_choice.pack(side="left", padx=8)
+
+        # Custom emails file picker
+        custom_frame = ttk.Frame(self.create_tab)
+        custom_frame.pack(fill="x", padx=10, pady=6)
+        self.use_custom_cb = ttk.Checkbutton(custom_frame, text="Sử dụng email tùy chỉnh (file)", variable=self.use_custom_emails)
+        self.use_custom_cb.pack(side="left")
+        ttk.Button(custom_frame, text="Chọn file email...", command=self.load_custom_emails).pack(side="left", padx=6)
+        self.custom_emails_label = ttk.Label(custom_frame, text="(0 email)" )
+        self.custom_emails_label.pack(side="left", padx=6)
+
+        # Proxies for creation
+        proxy_create_frame = ttk.Frame(self.create_tab)
+        proxy_create_frame.pack(fill="x", padx=10, pady=(0,6))
+        ttk.Label(proxy_create_frame, text="Proxy cho tạo tài khoản:").pack(side="left")
+        ttk.Button(proxy_create_frame, text="Chọn file proxy...", command=self.load_create_proxies).pack(side="left", padx=6)
+        self.create_proxies_label = ttk.Label(proxy_create_frame, text="(0 proxy)")
+        self.create_proxies_label.pack(side="left", padx=6)
 
         concurrency_frame = ttk.Frame(self.create_tab)
         concurrency_frame.pack(fill="x", padx=10, pady=5)
@@ -162,6 +202,14 @@ class MultiHotmailGUI:
         warmup_conc_spin = ttk.Spinbox(control, from_=1, to=3, width=4, textvariable=self.warmup_concurrency_var)
         warmup_conc_spin.pack(side="left")
 
+        # Warmup proxy file picker
+        warmup_proxy_frame = ttk.Frame(self.warmup_tab)
+        warmup_proxy_frame.pack(fill="x", padx=10, pady=(6, 4))
+        ttk.Label(warmup_proxy_frame, text="Proxy cho nuôi (tùy chọn):").pack(side="left")
+        ttk.Button(warmup_proxy_frame, text="Chọn file proxy...", command=self.load_warmup_proxies).pack(side="left", padx=6)
+        self.warmup_proxies_label = ttk.Label(warmup_proxy_frame, text="(0 proxy)")
+        self.warmup_proxies_label.pack(side="left", padx=6)
+
         ttk.Label(control, text="Lọc trạng thái:").pack(side="left", padx=(15, 4))
         self.warmup_status_filter = ttk.Combobox(control, values=["created", "warmup_failed", "warmed", "all"], width=13, state="readonly")
         self.warmup_status_filter.set("created")
@@ -178,7 +226,7 @@ class MultiHotmailGUI:
 
         self.warmup_tree = ttk.Treeview(
             self.warmup_tab,
-            columns=("stt", "email", "status", "last"),
+            columns=("stt", "email", "status", "last", "otp"),
             show="headings",
             height=12,
             selectmode="extended",
@@ -187,10 +235,12 @@ class MultiHotmailGUI:
         self.warmup_tree.heading("email", text="Email")
         self.warmup_tree.heading("status", text="Trạng thái")
         self.warmup_tree.heading("last", text="Hoạt động cuối")
+        self.warmup_tree.heading("otp", text="OTP")
         self.warmup_tree.column("stt", width=60, anchor="center")
         self.warmup_tree.column("email", width=260, anchor="w")
         self.warmup_tree.column("status", width=120, anchor="center")
-        self.warmup_tree.column("last", width=180, anchor="center")
+        self.warmup_tree.column("last", width=140, anchor="center")
+        self.warmup_tree.column("otp", width=160, anchor="center")
         self.warmup_tree.pack(fill="both", expand=True, padx=10, pady=10)
 
         status_frame = ttk.Frame(self.warmup_tab)
@@ -270,6 +320,7 @@ class MultiHotmailGUI:
 
     def start_creation(self):
         try:
+            # start_creation: proceed normally (file-reading checks are handled when loading files)
             if self.running:
                 print("⚠️ Đang trong quá trình tạo tài khoản!")
                 return
@@ -277,6 +328,27 @@ class MultiHotmailGUI:
             if total <= 0:
                 print("Số tài khoản phải lớn hơn 0")
                 return
+            # If user selected custom emails, prefer using that list size for total
+            try:
+                if self.use_custom_emails.get():
+                    with self.custom_emails_lock:
+                        available = len(self.custom_emails)
+                    if available > 0:
+                        # If user left default 1 but file contains many entries, create them all
+                        if total <= 1 and available > 1:
+                            total = available
+                            # update UI field to reflect chosen total
+                            try:
+                                self.num_accounts.delete(0, tk.END)
+                                self.num_accounts.insert(0, str(total))
+                            except Exception:
+                                pass
+                        else:
+                            total = min(total, available)
+
+            except Exception:
+                pass
+
             # Giới hạn tối đa 3 cửa sổ chạy song song (mặc định 1 để an toàn)
             try:
                 requested_concurrency = int(self.concurrency_var.get())
@@ -314,164 +386,213 @@ class MultiHotmailGUI:
 
             # Bộ đếm công việc dùng chung giữa các worker
             lock = threading.Lock()
-            self.total_to_create = total
-            self.created_count = 0
+            # If we're using a custom email list and user wants to only create those,
+            # prefer to process exactly that many and do NOT generate extra addresses.
+            only_custom = False
+            try:
+                if self.use_custom_emails.get():
+                    with self.custom_emails_lock:
+                        available = len(self.custom_emails)
+                    if available > 0:
+                        only_custom = True
+                        total = available
+                        # reflect actual total in the UI so users see that only their emails will be used
+                        try:
+                            self.num_accounts.delete(0, tk.END)
+                            self.num_accounts.insert(0, str(total))
+                        except Exception:
+                            pass
 
-            def worker(fast_mode: bool, domain_choice: str, fixed_pwd: str | None, columns_count: int, index: int):
+            except Exception:
+                pass
+
+            self.total_to_create = total
+            # created_count == number of successful creations
+            self.created_count = 0
+            # processed_count == number of email attempts processed (success/fail)
+            self.processed_count = 0
+
+            def worker(fast_mode: bool, domain_choice: str, fixed_pwd: str | None, columns_count: int, index: int, only_custom_mode: bool):
                 async def run_one():
                     bot = None
                     browser = None
-                    
-                    # Tính toán vị trí và kích thước cửa sổ trước khi vào vòng lặp
+
+                    # layout/window math (same as before)
                     pad = 10
-                    # Giữ kích cỡ popup nhỏ gọn ngay cả khi chỉ chạy 1 cửa sổ bằng cách giả lập layout 3 cột
                     columns = max(1, min(3, columns_count))
                     layout_columns = columns if columns > 1 else 3
-                    # Tính kích thước mỗi cửa sổ để chia đều màn hình
-                    # Công thức: (màn hình - 4 khoảng padding) / 3 cửa sổ
                     win_w = int((self.screen_w - (layout_columns + 1) * pad) / layout_columns)
-                    # Giảm chiều cao để popup thấp hơn màn hình (≈55% chiều cao) nhằm tránh phần trắng phía dưới
                     target_height = int(self.screen_h * 0.55)
                     win_h = min(target_height, self.screen_h - 2 * pad, 620)
-                    # Đảm bảo kích thước tối thiểu để hiển thị web
-                    win_w = max(win_w, 400)  # Tối thiểu 400px để hiển thị web
-                    win_h = max(win_h, 355)  # Tối thiểu 360px để hiển thị web
-                    # Tính lại win_w sau khi đảm bảo tối thiểu, chia lại đều để không tràn
+                    win_w = max(win_w, 400)
+                    win_h = max(win_h, 355)
                     total_used_w = win_w * layout_columns + pad * (layout_columns + 1)
                     if total_used_w > self.screen_w:
                         win_w = int((self.screen_w - (layout_columns + 1) * pad) / layout_columns)
                     win_h = min(win_h, self.screen_h - 2 * pad)
-                    # Vị trí xếp từ trái qua phải lần lượt, chia đều màn hình
                     col = index % layout_columns
                     x = pad + col * (win_w + pad)
                     y = pad
-                    
-                    # Tạo bot và browser ngay khi worker khởi động (chỉ 1 lần)
+
+                    # pick worker proxy
+                    proxy_for_worker = None
                     try:
-                        # Luôn hiển thị cửa sổ trong GUI để người dùng quan sát
-                        bot = await botright.Botright(
-                            headless=False,
-                            block_images=fast_mode,
-                            user_action_layer=False,
-                        )
-                        browser = await bot.new_browser(
-                            viewport={"width": win_w, "height": win_h},
-                            extra_args=[f"--window-position={x},{y}", f"--window-size={win_w},{win_h}"]
-                        )
+                        with self.create_proxy_lock:
+                            if self.create_proxies:
+                                if self.create_proxy_index >= len(self.create_proxies):
+                                    self.create_proxy_index = 0
+                                proxy_for_worker = self.create_proxies[self.create_proxy_index]
+                                self.create_proxy_index = (self.create_proxy_index + 1) % max(1, len(self.create_proxies))
+                    except Exception:
+                        proxy_for_worker = None
+
+                    try:
+                        # init bot/browser
+                        bot = await botright.Botright(headless=False, block_images=fast_mode, user_action_layer=False)
+                        browser = await bot.new_browser(viewport={"width": win_w, "height": win_h}, extra_args=[f"--window-position={x},{y}", f"--window-size={win_w},{win_h}"], proxy=proxy_for_worker or None)
                         page = await browser.new_page()
-                        # Đảm bảo cửa sổ hiển thị trước khi thao tác
                         try:
                             await page.bring_to_front()
                         except Exception:
                             pass
                         await asyncio.sleep(1.0)
-                        
-                        # Khai báo biến trước vòng lặp để dùng trong finally
-                        job_decremented = False
-                        created_success = False
-                        
-                        # Vòng lặp tạo tài khoản trong worker này
-                        while self.running:
-                            with lock:
-                                if self.created_count >= self.total_to_create:
-                                    break
-                                job_idx = self.created_count + 1  # chỉ số hiển thị
-                            
-                            # Theo dõi sự kiện đóng cửa sổ để trừ mục tiêu ngay lập tức
-                            job_decremented = False
-                            def _on_page_close(*_args, **_kwargs):
-                                nonlocal job_decremented
-                                if job_decremented:
-                                    return
-                                with lock:
-                                    if self.total_to_create > self.created_count:
-                                        self.total_to_create -= 1
-                                        remain = self.total_to_create - self.created_count
-                                    else:
-                                        remain = 0
-                                job_decremented = True
-                                self.window.after(0, self.status_var.set, f"Đã tạo {self.created_count}/{self.total_to_create} tài khoản (còn {remain})")
-                            try:
-                                page.on("close", _on_page_close)
-                            except Exception:
-                                pass
-                            try:
-                                await page.set_default_timeout(60000)
-                                await page.set_default_navigation_timeout(90000)
-                            except Exception:
-                                pass
 
-                            created_success = False  # Reset cho mỗi lần tạo tài khoản
+                        while self.running:
+                            # decide if we stop (different behavior for only_custom_mode)
+                            with lock:
+                                if only_custom_mode:
+                                    if self.processed_count >= self.total_to_create:
+                                        break
+                                else:
+                                    if self.created_count >= self.total_to_create:
+                                        break
+
+                            # default per-job assignments
+                            assigned_proxy = proxy_for_worker
+                            assigned_password = fixed_pwd
+                            email_prefix_to_use = "myuser"
+                            domain = domain_choice if domain_choice in ("hotmail", "outlook") else random.choice(["hotmail", "outlook"])
+                            processed_this_attempt = False
+
+                            # consume a custom entry if available
+                            if self.use_custom_emails.get():
+                                next_entry = None
+                                with self.custom_emails_lock:
+                                    if self.custom_emails:
+                                        try:
+                                            next_entry = self.custom_emails.popleft()
+                                        except Exception:
+                                            next_entry = None
+                                # stop if only_custom_mode is set and no entries left
+                                if only_custom_mode and not next_entry:
+                                    break
+                                if next_entry:
+                                    processed_this_attempt = True
+                                    if isinstance(next_entry, dict):
+                                        ep = (next_entry.get('email') or next_entry.get('Email') or '').strip()
+                                        email_part = ep
+                                        p = (next_entry.get('proxy') or next_entry.get('proxy_create') or next_entry.get('warmup_proxy') or '').strip() or None
+                                        pw = (next_entry.get('password') or next_entry.get('Password') or '').strip() or None
+                                    else:
+                                        raw = str(next_entry)
+                                        parts = [p.strip() for p in raw.split('|',1)] if '|' in raw else ([p.strip() for p in raw.split(',',1)] if ',' in raw else [raw])
+                                        email_part = parts[0]
+                                        p = parts[1] if len(parts) > 1 else None
+                                        pw = None
+
+                                    if '@' in (email_part or ''):
+                                        local, dom = email_part.split('@',1)
+                                        email_prefix_to_use = local
+                                        dom_lower = dom.lower()
+                                        if 'hotmail' in dom_lower:
+                                            domain = 'hotmail'
+                                        elif 'outlook' in dom_lower:
+                                            domain = 'outlook'
+                                    else:
+                                        email_prefix_to_use = email_part or email_prefix_to_use
+
+                                    if p:
+                                        assigned_proxy = p
+                                    if pw:
+                                        assigned_password = pw
+
+                            # if proxy changed for this job, recreate browser/context
+                            if assigned_proxy and assigned_proxy != proxy_for_worker:
+                                try:
+                                    await browser.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    browser = await bot.new_browser(viewport={"width": win_w, "height": win_h}, extra_args=[f"--window-position={x},{y}", f"--window-size={win_w},{win_h}"], proxy=assigned_proxy)
+                                    page = await browser.new_page()
+                                    try:
+                                        await page.bring_to_front()
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    print("⚠️ Không thể khởi tạo browser với proxy riêng cho email, tiếp tục với proxy worker (nếu có)")
+                                else:
+                                    proxy_for_worker = assigned_proxy
+
+                            creator = HotmailAccountCreator()
                             try:
-                                creator = HotmailAccountCreator()
-                                domain = domain_choice if domain_choice in ("hotmail", "outlook") else random.choice(["hotmail", "outlook"]) 
-                                account = await creator.create_account(page, email_prefix="myuser", domain=domain, password=fixed_pwd)
-                                just_finished = False
+                                account = await creator.create_account(page, email_prefix=email_prefix_to_use, domain=domain, password=assigned_password)
+                                success = bool(account)
                                 attempt_email = creator.last_full_email or "(unknown)"
                                 attempt_password = creator.last_password or "-"
-                                if account and self.running:
-                                    self.window.after(0, self.add_account_to_table, account["email"], account["password"], "SUCCESS")
-                                    # Chỉ tăng bộ đếm khi thành công
-                                    with lock:
-                                        self.created_count += 1
-                                        done = self.created_count
-                                        if self.created_count >= self.total_to_create:
-                                            self.running = False
-                                            just_finished = True
-                                        created_success = True
-                                    self.window.after(0, self.status_var.set, f"Đã tạo {done}/{self.total_to_create} tài khoản")
-                                    if just_finished:
-                                        print("✅ ĐÃ HOÀN THÀNH TẤT CẢ TÀI KHOẢN")
-                                else:
-                                    if self.running:
-                                        failure_text = f"Tạo tài khoản #{job_idx} thất bại, dừng toàn bộ."
-                                        self.window.after(0, self.add_account_to_table, attempt_email, attempt_password, "FAILED")
-                                        self._abort_creation(failure_text)
-                                        job_decremented = True
-                                    break
-                            except TargetClosedError as e:
-                                # Người dùng đóng cửa sổ: giảm mục tiêu tổng nếu còn dư
+                            except TargetClosedError:
+                                success = False
+                                attempt_email = creator.last_full_email or "(unknown)"
+                                attempt_password = creator.last_password or "-"
+                                # If page closed, reduce the target count
                                 with lock:
                                     if self.total_to_create > self.created_count:
                                         self.total_to_create -= 1
-                                        remain = self.total_to_create - self.created_count
-                                    else:
-                                        remain = 0
-                                job_decremented = True
-                                self.window.after(0, self.status_var.set, f"Đã tạo {self.created_count}/{self.total_to_create} tài khoản (còn {remain})")
-                                # Không raise để finally đóng tài nguyên và worker lặp tiếp
-                                break  # Thoát vòng lặp khi đóng cửa sổ
                             except Exception as e:
-                                msg = str(e).lower()
-                                closed_signals = [
-                                    "target page, context or browser has been closed",
-                                    "browser has been closed",
-                                    "context has been closed",
-                                    "target closed",
-                                ]
-                                if any(sig in msg for sig in closed_signals):
-                                    # Xem như người dùng/tự động đóng cửa sổ ⇒ giảm mục tiêu
-                                    with lock:
-                                        if self.total_to_create > self.created_count:
-                                            self.total_to_create -= 1
-                                            remain = self.total_to_create - self.created_count
-                                        else:
-                                            remain = 0
-                                    job_decremented = True
-                                    self.window.after(0, self.status_var.set, f"Đã tạo {self.created_count}/{self.total_to_create} tài khoản (còn {remain})")
-                                    break  # Thoát vòng lặp khi đóng cửa sổ
-                                else:
-                                    print(f"⚠️ Lỗi trong worker (job {job_idx}): {e}")
-                                    if self.running:
-                                        self.window.after(0, self.add_account_to_table, attempt_email, attempt_password, "FAILED")
-                                        self._abort_creation(f"Lỗi job {job_idx}: {e}")
-                                        job_decremented = True
-                                    break  # Thoát nếu lỗi khác
+                                success = False
+                                attempt_email = creator.last_full_email or "(unknown)"
+                                attempt_password = creator.last_password or "-"
+                                print(f"⚠️ Lỗi trong worker: {e}")
 
-                            if self.running:
-                                pause = random.uniform(20, 40)
-                                print(f"⏳ Nghỉ {pause:.1f}s trước lượt tiếp theo để giảm nghi ngờ bot...")
-                                await asyncio.sleep(pause)
+                            # record results and counts
+                            with lock:
+                                if success:
+                                    self.created_count += 1
+                                if processed_this_attempt or only_custom_mode:
+                                    # count attempts when using custom list
+                                    self.processed_count += 1
+
+                            # update UI
+                            if success and self.running:
+                                self.window.after(0, self.add_account_to_table, account["email"], account["password"], "SUCCESS")
+                            else:
+                                if self.running:
+                                    self.window.after(0, self.add_account_to_table, attempt_email, attempt_password, "FAILED")
+
+                            # persist proxy used for this account if present
+                            try:
+                                if success and (proxy_for_worker or assigned_proxy):
+                                    proxy_to_store = assigned_proxy or proxy_for_worker
+                                    try:
+                                        update_warmup_status(account["email"], status="created", proxy=proxy_to_store)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+
+                            # update status text
+                            if only_custom_mode:
+                                self.window.after(0, self.status_var.set, f"Đã tạo {self.processed_count}/{self.total_to_create} tài khoản")
+                                if self.processed_count >= self.total_to_create:
+                                    break
+                            else:
+                                self.window.after(0, self.status_var.set, f"Đã tạo {self.created_count}/{self.total_to_create} tài khoản")
+                                if self.created_count >= self.total_to_create:
+                                    break
+
+                            # short pause
+                            await asyncio.sleep(random.uniform(20,40))
+
                     finally:
                         try:
                             if browser:
@@ -483,15 +604,6 @@ class MultiHotmailGUI:
                                 await bot.close()
                         except Exception:
                             pass
-                        # Nếu job chưa thành công và chưa trừ bởi các handler, trừ mục tiêu còn lại
-                        if not created_success and not job_decremented:
-                            with lock:
-                                if self.total_to_create > self.created_count:
-                                    self.total_to_create -= 1
-                                    remain = self.total_to_create - self.created_count
-                                else:
-                                    remain = 0
-                            self.window.after(0, self.status_var.set, f"Đã tạo {self.created_count}/{self.total_to_create} tài khoản (còn {remain})")
 
                 asyncio.run(run_one())
 
@@ -500,7 +612,7 @@ class MultiHotmailGUI:
             for i in range(concurrency):
                 if not self.running:
                     break
-                t = threading.Thread(target=worker, args=(fast_mode_val, chosen_domain, fixed_pwd_value, layout_columns, i), daemon=True)
+                t = threading.Thread(target=worker, args=(fast_mode_val, chosen_domain, fixed_pwd_value, layout_columns, i, only_custom), daemon=True)
                 self.threads.append(t)
                 t.start()
                 # Giảm delay để tất cả cửa sổ khởi động gần như cùng lúc
@@ -541,8 +653,19 @@ class MultiHotmailGUI:
             self.warmup_tree.delete(item)
         for idx, acc in enumerate(accounts, 1):
             last = acc.get("last_activity_at") or "-"
+            # try to extract OTPs from warmup_note field if present
+            note = acc.get("warmup_note") or ""
+            otp_display = "-"
+            try:
+                # if note contains 'OTPs:' suffix, show it compactly
+                if "OTP" in note or "OTPs" in note:
+                    otp_display = note
+                else:
+                    otp_display = "-"
+            except Exception:
+                otp_display = "-"
             status = acc.get("status", "created")
-            self.warmup_tree.insert("", "end", iid=acc["email"], values=(idx, acc["email"], status, last))
+            self.warmup_tree.insert("", "end", iid=acc["email"], values=(idx, acc["email"], status, last, otp_display))
         if accounts:
             self.warmup_status_var.set(f"Đã nạp {len(accounts)} tài khoản (lọc {display_filter})")
         else:
@@ -577,6 +700,24 @@ class MultiHotmailGUI:
         except (TypeError, ValueError):
             requested_conc = 1
         concurrency = max(1, min(3, requested_conc, len(accounts)))
+
+        # If user provided warmup proxy file, assign proxies round-robin to accounts missing proxy
+        if self.warmup_proxies:
+            try:
+                with self.warmup_proxy_lock:
+                    idx = self.warmup_proxy_index or 0
+                    for acc in accounts:
+                        if not acc.get("proxy"):
+                            proxy = self.warmup_proxies[idx % len(self.warmup_proxies)]
+                            acc["proxy"] = proxy
+                            try:
+                                update_warmup_status(acc["email"], status="created", proxy=proxy)
+                            except Exception:
+                                pass
+                            idx += 1
+                    self.warmup_proxy_index = idx % max(1, len(self.warmup_proxies))
+            except Exception:
+                pass
 
         self.warmup_queue = queue.Queue()
         for acc in accounts:
@@ -622,11 +763,11 @@ class MultiHotmailGUI:
                     break
                 email = account["email"]
                 target_email = self._pick_warmup_recipient(email)
-                self.window.after(0, self._update_warmup_row, email, "Đang đăng nhập...", "...")
+                self.window.after(0, self._update_warmup_row, email, "Đang đăng nhập...", "...", "")
                 success = False
                 note = ""
                 try:
-                    success = await warmup_account(
+                    success, otps = await warmup_account(
                         account,
                         proxy=account.get("proxy"),
                         window_conf=window_conf,
@@ -637,7 +778,13 @@ class MultiHotmailGUI:
                     success = False
                 status_text = "WARMED" if success else "FAILED"
                 last_activity = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") if success else "-"
-                self.window.after(0, self._update_warmup_row, email, status_text, last_activity)
+                otp_text = ""
+                try:
+                    if otps:
+                        otp_text = ",".join([str(x) for x in otps])
+                except Exception:
+                    otp_text = ""
+                self.window.after(0, self._update_warmup_row, email, status_text, last_activity, otp_text)
                 message = f"{email} -> {status_text}"
                 if note:
                     message += f" ({note})"
@@ -673,7 +820,7 @@ class MultiHotmailGUI:
             return ring[0]
         return ring[(idx + 1) % len(ring)]
 
-    def _update_warmup_row(self, email: str, status_text: str, last_activity: str):
+    def _update_warmup_row(self, email: str, status_text: str, last_activity: str, otp_text: str = ""):
         if email not in self.warmup_tree.get_children():
             return
         current = list(self.warmup_tree.item(email, "values"))
@@ -681,7 +828,293 @@ class MultiHotmailGUI:
             return
         current[2] = status_text
         current[3] = last_activity
+        # Ensure we have an OTP column value available
+        try:
+            if len(current) < 5:
+                # pad if needed
+                while len(current) < 5:
+                    current.append("")
+            current[4] = otp_text or current[4] or "-"
+        except Exception:
+            pass
         self.warmup_tree.item(email, values=current)
+
+    # ----- File/load helpers -----
+    def load_custom_emails(self):
+        path = filedialog.askopenfilename(title="Chọn file chứa email (txt/csv/xlsx)", filetypes=[("Excel files", "*.xlsx;*.xls"), ("Text/CSV", "*.txt;*.csv"), ("All files", "*")])
+        if not path:
+            return
+        # if excel but no reader libs installed -> inform user
+        if path.lower().endswith(('.xls', '.xlsx')) and not (pd or load_workbook):
+            messagebox.showerror("Thiếu thư viện",
+                                 "Để đọc file Excel bạn cần cài pandas hoặc openpyxl. Ví dụ: pip install pandas openpyxl")
+            return
+        try:
+            if path.lower().endswith(('.xls', '.xlsx')):
+                # Read Excel using pandas
+                if pd:
+                    df = pd.read_excel(path, dtype=str)
+                    df = df.fillna("")
+                elif load_workbook:
+                    wb = load_workbook(path, read_only=True)
+                    ws = wb.active
+                    rows = list(ws.iter_rows(values_only=True))
+                    if not rows:
+                        messagebox.showwarning("Không có dữ liệu", "File Excel rỗng")
+                        return
+                    headers = [str(x) if x is not None else "" for x in rows[0]]
+                    data_rows = rows[1:]
+                    import collections
+                    df = collections.defaultdict(list)
+                    for r in data_rows:
+                        for i, val in enumerate(r):
+                            df[headers[i] if i < len(headers) else str(i)].append(val if val is not None else "")
+                    # convert to a simple object with .columns and list-like access used later
+                    class SimpleDF:
+                        def __init__(self, mapping):
+                            self._m = mapping
+                            self.columns = list(mapping.keys())
+                        def iterrows(self):
+                            # return (idx, rowdict)
+                            length = len(next(iter(self._m.values())) ) if self._m else 0
+                            for idx in range(length):
+                                row = {k: (self._m[k][idx] if idx < len(self._m[k]) else "") for k in self._m}
+                                yield idx, row
+                        def __getitem__(self, col):
+                            return self._m.get(col, [])
+                    df = SimpleDF(df)
+                # Try to find column names for email, password and proxy
+                email_col = None
+                proxy_col = None
+                password_col = None
+                warmup_col = None
+                cols = [c.lower() for c in df.columns]
+                for c in df.columns:
+                    low = c.lower()
+                    if not email_col and any(k in low for k in ("email", "e-mail", "address")):
+                        email_col = c
+                    if not password_col and any(k in low for k in ("password", "pwd", "pass")):
+                        password_col = c
+                    if not proxy_col and any(k in low for k in ("proxy", "proxy_create", "create_proxy")):
+                        proxy_col = c
+                    if not warmup_col and any(k in low for k in ("warmup_proxy", "proxy_warmup", "proxy_warm")):
+                        warmup_col = c
+
+                items = []
+                if email_col:
+                    for _, row in df.iterrows():
+                        email_val = str(row.get(email_col) or "").strip()
+                        if not email_val:
+                            continue
+                        entry = {"email": email_val}
+                        if password_col:
+                            pw = str(row.get(password_col) or "").strip()
+                            if pw:
+                                entry["password"] = pw
+                        if proxy_col:
+                            p = str(row.get(proxy_col) or "").strip()
+                            if p:
+                                entry["proxy"] = p
+                        if warmup_col:
+                            wp = str(row.get(warmup_col) or "").strip()
+                            if wp:
+                                entry["warmup_proxy"] = wp
+                        items.append(entry)
+                else:
+                    messagebox.showwarning("Không có email", "File excel không có cột email phù hợp")
+                    return
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = [l.strip() for l in f.readlines()]
+                items = [l for l in lines if l and not l.startswith("#")]
+        except Exception as e:
+            messagebox.showerror("Lỗi đọc file", f"Không thể đọc file: {e}")
+            return
+        if not items:
+            messagebox.showwarning("Không có email", "File không chứa email hợp lệ")
+            return
+        # normalize entries into dicts: if a simple string is present, we'll keep as raw string
+        normalized = []
+        for entry in items:
+            if isinstance(entry, dict):
+                normalized.append(entry)
+            else:
+                raw = str(entry)
+                # try to split if contains separators
+                if '|' in raw:
+                    left, right = raw.split('|', 1)
+                    normalized.append({"email": left.strip(), "proxy": right.strip()})
+                elif ',' in raw:
+                    parts = [p.strip() for p in raw.split(',') if p.strip()]
+                    if len(parts) == 1:
+                        normalized.append({"email": parts[0]})
+                    elif len(parts) == 2:
+                        # decide whether second column looks like a proxy or a password
+                        second = parts[1]
+                        if ':' in second or '@' in second or second.count('.') >= 1:
+                            normalized.append({"email": parts[0], "proxy": parts[1]})
+                        else:
+                            normalized.append({"email": parts[0], "password": parts[1]})
+                    else:
+                        # more than two columns -> email,password,proxy (best-effort)
+                        normalized.append({"email": parts[0], "password": parts[1], "proxy": parts[2]})
+                else:
+                    normalized.append({"email": raw})
+
+        # enable custom email mode automatically and store
+        with self.custom_emails_lock:
+            self.custom_emails.clear()
+            for item in normalized:
+                self.custom_emails.append(item)
+        # If user loaded an XLSX but neither pandas nor openpyxl were available, advise them
+        if path.lower().endswith(('.xls', '.xlsx')) and not (pd or load_workbook):
+            messagebox.showerror("Thiếu thư viện",
+                                 "Để đọc file Excel bạn cần cài pandas hoặc openpyxl. Ví dụ: pip install pandas openpyxl")
+            return
+        # mark checkbox on so user doesn't need to toggle
+        try:
+            self.use_custom_emails.set(True)
+        except Exception:
+            pass
+        self.custom_emails_label.config(text=f"({len(self.custom_emails)} email)")
+        messagebox.showinfo("Đã nạp email", f"Đã nạp {len(self.custom_emails)} email từ file")
+
+    def load_create_proxies(self):
+        path = filedialog.askopenfilename(title="Chọn file proxy cho tạo tài khoản", filetypes=[("Proxy list (.txt/.csv/.xlsx)", "*.txt;*.csv;*.xlsx;*.xls"), ("All files", "*")])
+        if not path:
+            return
+        if path.lower().endswith(('.xls', '.xlsx')) and not (pd or load_workbook):
+            messagebox.showerror("Thiếu thư viện",
+                                 "Để đọc file Excel bạn cần cài pandas hoặc openpyxl. Ví dụ: pip install pandas openpyxl")
+            return
+        try:
+            if path.lower().endswith(('.xls', '.xlsx')):
+                if pd:
+                    df = pd.read_excel(path, dtype=str)
+                    df = df.fillna("")
+                elif load_workbook:
+                    wb = load_workbook(path, read_only=True)
+                    ws = wb.active
+                    rows = list(ws.iter_rows(values_only=True))
+                    if not rows:
+                        messagebox.showwarning("Không có dữ liệu", "File Excel rỗng")
+                        return
+                    headers = [str(x) if x is not None else "" for x in rows[0]]
+                    data_rows = rows[1:]
+                    import collections
+                    df = collections.defaultdict(list)
+                    for r in data_rows:
+                        for i, val in enumerate(r):
+                            df[headers[i] if i < len(headers) else str(i)].append(val if val is not None else "")
+                    class SimpleDF:
+                        def __init__(self, mapping):
+                            self._m = mapping
+                            self.columns = list(mapping.keys())
+                        def __iter__(self):
+                            # iterate rows by index
+                            length = len(next(iter(self._m.values())) ) if self._m else 0
+                            for idx in range(length):
+                                yield {k: (self._m[k][idx] if idx < len(self._m[k]) else "") for k in self._m}
+                        def __getitem__(self, col):
+                            return self._m.get(col, [])
+                    df = SimpleDF(df)
+                # pick column that looks like proxy if exists, else first column
+                proxy_col = None
+                for c in df.columns:
+                    if 'proxy' in str(c).lower():
+                        proxy_col = c
+                        break
+                if proxy_col is None:
+                    try:
+                        if hasattr(df, 'shape') and df.shape[1] >= 1:
+                            proxy_col = df.columns[0]
+                        elif hasattr(df, 'columns') and len(df.columns) >= 1:
+                            proxy_col = df.columns[0]
+                    except Exception:
+                        # best-effort fallback
+                        if hasattr(df, 'columns') and len(df.columns) >= 1:
+                            proxy_col = df.columns[0]
+                vals = df[proxy_col]
+                if hasattr(vals, 'tolist'):
+                    vals = vals.tolist()
+                proxies = [str(v).strip() for v in vals if str(v).strip()]
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = [l.strip() for l in f.readlines()]
+                proxies = [l for l in lines if l and not l.startswith("#")]
+        except Exception as e:
+            messagebox.showerror("Lỗi đọc file", f"Không thể đọc file: {e}")
+            return
+        with self.create_proxy_lock:
+            self.create_proxies = proxies
+            self.create_proxy_index = 0
+        self.create_proxies_label.config(text=f"({len(self.create_proxies)} proxy)")
+        messagebox.showinfo("Đã nạp proxy", f"Đã nạp {len(self.create_proxies)} proxy cho tạo tài khoản")
+
+    def load_warmup_proxies(self):
+        path = filedialog.askopenfilename(title="Chọn file proxy cho nuôi", filetypes=[("Proxy list (.txt/.csv/.xlsx)", "*.txt;*.csv;*.xlsx;*.xls"), ("All files", "*")])
+        if not path:
+            return
+        if path.lower().endswith(('.xls', '.xlsx')) and not (pd or load_workbook):
+            messagebox.showerror("Thiếu thư viện",
+                                 "Để đọc file Excel bạn cần cài pandas hoặc openpyxl. Ví dụ: pip install pandas openpyxl")
+            return
+        try:
+            if path.lower().endswith(('.xls', '.xlsx')):
+                if pd:
+                    df = pd.read_excel(path, dtype=str)
+                    df = df.fillna("")
+                elif load_workbook:
+                    wb = load_workbook(path, read_only=True)
+                    ws = wb.active
+                    rows = list(ws.iter_rows(values_only=True))
+                    if not rows:
+                        messagebox.showwarning("Không có dữ liệu", "File Excel rỗng")
+                        return
+                    headers = [str(x) if x is not None else "" for x in rows[0]]
+                    data_rows = rows[1:]
+                    import collections
+                    df = collections.defaultdict(list)
+                    for r in data_rows:
+                        for i, val in enumerate(r):
+                            df[headers[i] if i < len(headers) else str(i)].append(val if val is not None else "")
+                    class SimpleDF:
+                        def __init__(self, mapping):
+                            self._m = mapping
+                            self.columns = list(mapping.keys())
+                        def __getitem__(self, col):
+                            return self._m.get(col, [])
+                    df = SimpleDF(df)
+                proxy_col = None
+                for c in df.columns:
+                    if 'proxy' in str(c).lower():
+                        proxy_col = c
+                        break
+                if proxy_col is None:
+                    try:
+                        if hasattr(df, 'shape') and df.shape[1] >= 1:
+                            proxy_col = df.columns[0]
+                        elif hasattr(df, 'columns') and len(df.columns) >= 1:
+                            proxy_col = df.columns[0]
+                    except Exception:
+                        if hasattr(df, 'columns') and len(df.columns) >= 1:
+                            proxy_col = df.columns[0]
+                vals = df[proxy_col]
+                if hasattr(vals, 'tolist'):
+                    vals = vals.tolist()
+                proxies = [str(v).strip() for v in vals if str(v).strip()]
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = [l.strip() for l in f.readlines()]
+                proxies = [l for l in lines if l and not l.startswith("#")]
+        except Exception as e:
+            messagebox.showerror("Lỗi đọc file", f"Không thể đọc file: {e}")
+            return
+        with self.warmup_proxy_lock:
+            self.warmup_proxies = proxies
+            self.warmup_proxy_index = 0
+        self.warmup_proxies_label.config(text=f"({len(self.warmup_proxies)} proxy)")
+        messagebox.showinfo("Đã nạp proxy", f"Đã nạp {len(self.warmup_proxies)} proxy cho nuôi")
 
 def main():
     app = MultiHotmailGUI()

@@ -7,6 +7,7 @@ import random
 import time
 from datetime import datetime
 from typing import Optional
+import re
 
 import botright
 
@@ -286,13 +287,112 @@ async def _click_first_selector(page, selectors: list[str], *, timeout: int = 60
     return False
 
 
+async def _extract_otps_from_text(text: str) -> list[str]:
+    """Find likely OTP codes in a block of text.
+
+    This looks for groups of 4-8 digits (common OTP lengths) and returns
+    unique matches in order of appearance.
+    """
+    if not text:
+        return []
+    # find digit groups of length 4 to 8
+    matches = re.findall(r"\b(\d{4,8})\b", text)
+    seen = set()
+    out = []
+    for m in matches:
+        if m not in seen:
+            out.append(m)
+            seen.add(m)
+    return out
+
+
+async def _scan_inbox_for_otps(page, max_messages: int = 6) -> list[str]:
+    """Scan the first N messages in the inbox reading bodies for OTP-like codes.
+
+    Returns a list of discovered OTP codes (may be empty). The function is
+    defensive about selectors since Outlook UI often changes.
+    """
+    otps = []
+    try:
+        # Ensure we're on mail page which we usually are when called
+        await page.goto("https://outlook.live.com/mail/0/", wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(1.5)
+
+        # Try to make sure Inbox is selected
+        await _select_folder(page, "Inbox")
+        await asyncio.sleep(1.0)
+
+        # Message list items - try some selectors and pick the visible ones
+        list_selectors = [
+            "div[role='option']",
+            "div[role='listitem']",
+            "div[data-selection-index]",
+            "div[aria-label*='Unread']",
+        ]
+        rows = []
+        for sel in list_selectors:
+            try:
+                found = await page.query_selector_all(sel)
+                if found and len(found) > 0:
+                    rows = found
+                    break
+            except Exception:
+                continue
+
+        if not rows:
+            return []
+
+        # Limit to first max_messages rows
+        for row in rows[:max_messages]:
+            try:
+                # open the message in the reading pane by clicking
+                await row.scroll_into_view_if_needed()
+                await row.click()
+                await asyncio.sleep(0.8)
+
+                # Candidate content selectors inside a opened message
+                content_selectors = [
+                    "div[aria-label='Message body']",
+                    "div[role='document']",
+                    "div[aria-label*='Message body']",
+                    "div[role='main']",
+                ]
+                message_text = None
+                for sel in content_selectors:
+                    try:
+                        el = await page.wait_for_selector(sel, timeout=1800)
+                        if el:
+                            message_text = await el.inner_text()
+                            if message_text and len(message_text) > 10:
+                                break
+                    except Exception:
+                        continue
+
+                if message_text:
+                    found = await _extract_otps_from_text(message_text)
+                    if found:
+                        for code in found:
+                            if code not in otps:
+                                otps.append(code)
+                                print(f"[Warmup][OTP] Found OTP: {code}")
+                # small pause before next
+                await asyncio.sleep(0.4)
+            except Exception:
+                continue
+
+    except Exception as exc:
+        print(f"[Warmup] OTP scan failed: {exc}")
+
+    return otps
+
+
 async def warmup_account(
     account: dict,
     *,
     proxy: Optional[str] = None,
     window_conf: Optional[dict] = None,
     target_email: Optional[str] = None,
-) -> bool:
+) -> tuple[bool, list[str]]:
     bot = None
     browser = None
     page = None
@@ -343,6 +443,11 @@ async def warmup_account(
         await page.goto("https://outlook.live.com/mail/0/", wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(random.uniform(3, 6))
 
+        # Scan inbox for OTP codes and print them (helpful during warmup)
+        otps_before = await _scan_inbox_for_otps(page, max_messages=6)
+        if otps_before:
+            print(f"[Warmup] OTPs found before actions for {email}: {otps_before}")
+
         results = []
         results.append(("open_inbox", True))
         mark_success = await _mark_first_mail(page)
@@ -357,11 +462,34 @@ async def warmup_account(
             print("[Warmup] Không đánh dấu được thư nào, vẫn tiếp tục gửi mail")
         send_success = await _send_test_mail(page, sender=email, target=recipient)
         results.append(("send_test", send_success))
+
+        # After sending a test email it's possible there are new messages with OTPs
+        otps_after = await _scan_inbox_for_otps(page, max_messages=6)
+        if otps_after:
+            print(f"[Warmup] OTPs found after actions for {email}: {otps_after}")
         print("[Warmup] Bỏ qua bước add_contact theo yêu cầu")
 
         success = all(flag for _, flag in results)
         status = "warmed" if success else "warmup_failed"
         note = ", ".join(f"{name}:{'ok' if ok else 'fail'}" for name, ok in results)
+        # include any found OTP codes in the warmup note
+        try:
+            otp_found = []
+            if otps_before:
+                otp_found.extend(otps_before)
+            if otps_after:
+                otp_found.extend(otps_after)
+            if otp_found:
+                # dedupe while preserving order
+                seen = set()
+                order = []
+                for c in otp_found:
+                    if c not in seen:
+                        seen.add(c)
+                        order.append(c)
+                note = note + "; OTPs: " + ",".join(order)
+        except Exception:
+            pass
         update_warmup_status(
             email,
             status=status,
@@ -370,11 +498,27 @@ async def warmup_account(
             last_activity_at=datetime.utcnow().isoformat(),
         )
         print(f"[Warmup] Hoàn tất {email}: {note}")
-        return success
+        # return success flag + list of discovered OTPs (may be empty)
+        otp_found = []
+        try:
+            if otps_before:
+                otp_found.extend(otps_before)
+            if otps_after:
+                otp_found.extend(otps_after)
+            # dedupe while preserving order
+            seen = set()
+            deduped = []
+            for c in otp_found:
+                if c not in seen:
+                    seen.add(c)
+                    deduped.append(c)
+            return success, deduped
+        except Exception:
+            return success, []
     except Exception as exc:
         print(f"[Warmup] Lỗi với {email}: {exc}")
         update_warmup_status(email, status="warmup_failed", note=str(exc))
-        return False
+        return False, []
     finally:
         if browser:
             try:
@@ -396,7 +540,9 @@ async def main():
 
     for acc in pending:
         proxy = acc.get("proxy")
-        await warmup_account(acc, proxy=proxy)
+        ok, otps = await warmup_account(acc, proxy=proxy)
+        if otps:
+            print(f"[Warmup] OTPs for {acc.get('email')}: {otps}")
         await asyncio.sleep(random.uniform(10, 25))
 
 
