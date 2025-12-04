@@ -310,5 +310,21 @@
         "lastname": "Brown",
         "birthdate": "September 7, 2005",
         "created_time": "2025-11-21 13:45:54"
+    },
+    {
+        "email": "zenora.tech402wx6wlvit2w@outlook.com",
+        "password": "Nw3&Zj82Lm",
+        "firstname": "Daniel",
+        "lastname": "Davies",
+        "birthdate": "February 15, 2005",
+        "created_time": "2025-12-02 11:07:06"
+    },
+    {
+        "email": "shadowbyte_1574u1t67v5c5@outlook.com",
+        "password": "Hb8*WqrY21",
+        "firstname": "Daniel",
+        "lastname": "Jones",
+        "birthdate": "October 16, 1999",
+        "created_time": "2025-12-02 11:11:18"
     }
 ]

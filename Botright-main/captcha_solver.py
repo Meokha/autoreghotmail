@@ -68,12 +68,41 @@ async def _fill_first_selector(page, selectors: list[str], value: str, *, timeou
     return False
 
 
-async def _send_test_mail(page, *, sender: str, target: str) -> bool:
+def _scale_timeout(value: int, fast: bool) -> int:
+    if fast:
+        return max(1000, int(value * 0.5))
+    return int(value)
+
+
+async def _send_test_mail(page, *, sender: str, target: str, fast: bool = False) -> bool:
     try:
-        await page.goto("https://outlook.live.com/mail/0/", wait_until="domcontentloaded", timeout=60000)
-        new_mail_btn = await page.wait_for_selector("button[aria-label='New mail']", timeout=15000)
-        await new_mail_btn.click()
-        await asyncio.sleep(2)
+        await page.goto("https://outlook.live.com/mail/0/", wait_until="domcontentloaded", timeout=_scale_timeout(60000, fast))
+        # Try multiple possible compose/selectors to handle UI variations
+        compose_selectors = [
+            "button[aria-label='New mail']",
+            "button[aria-label='New message']",
+            "button[title='New message']",
+            "button[data-icon-name='Mail']",
+            "[data-automation-id='NewMessageButton']",
+            "button[aria-label*='New']",
+        ]
+        new_mail_btn = None
+        for sel in compose_selectors:
+            try:
+                new_mail_btn = await page.wait_for_selector(sel, timeout=_scale_timeout(2500, fast))
+                if new_mail_btn:
+                    await new_mail_btn.click()
+                    break
+            except Exception:
+                new_mail_btn = None
+                continue
+        # if no compose button found, try keyboard shortcut 'N' (Outlook sometimes supports it)
+        if not new_mail_btn:
+            try:
+                await page.keyboard.press('n')
+            except Exception:
+                pass
+        await asyncio.sleep(1 if fast else 2)
 
         if not await _fill_recipient(page, target):
             raise RuntimeError("Không tìm thấy ô To trong cửa sổ compose")
@@ -81,11 +110,13 @@ async def _send_test_mail(page, *, sender: str, target: str) -> bool:
         subject_selectors = [
             "input[aria-label='Add a subject']",
             "input[aria-label='Subject']",
+            "input[placeholder*='Subject']",
+            "input[name='Subject']",
         ]
         subject = None
         for sel in subject_selectors:
             try:
-                subject = await page.wait_for_selector(sel, timeout=8000)
+                subject = await page.wait_for_selector(sel, timeout=_scale_timeout(8000, fast))
                 break
             except Exception:
                 continue
@@ -100,7 +131,18 @@ async def _send_test_mail(page, *, sender: str, target: str) -> bool:
         await subject.click()
         await asyncio.sleep(0.2)
         await _human_type(page, subject_text, delay_range=(0.04, 0.1))
-        body = await page.wait_for_selector("div[aria-label='Message body']", timeout=15000)
+        # find the message body area
+        body_selectors = ["div[aria-label='Message body']", "div[role='document']", "div[aria-label*='Message body']", "div[contenteditable='true'][aria-label*='Message body']"]
+        body = None
+        for sel in body_selectors:
+            try:
+                body = await page.wait_for_selector(sel, timeout=_scale_timeout(2500, fast))
+                if body:
+                    break
+            except Exception:
+                continue
+        if not body:
+            raise RuntimeError("Không tìm thấy ô nhập nội dung thư (body)")
         body_text = random.choice([
             "Just keeping the inbox active",
             "Automated warmup message, please ignore",
@@ -115,32 +157,49 @@ async def _send_test_mail(page, *, sender: str, target: str) -> bool:
             "button[aria-label='Send']",
             "button[id^='splitButton'][title*='Send']",
             "button[data-icon-name='Send']",
+            "button[role='button'][name='Send']",
         ]
         send_btn = None
         for sel in send_selectors:
             try:
-                send_btn = await page.wait_for_selector(sel, timeout=8000)
-                break
+                send_btn = await page.wait_for_selector(sel, timeout=_scale_timeout(2500, fast))
+                if send_btn:
+                    await send_btn.click()
+                    break
             except Exception:
+                send_btn = None
                 continue
+
+        # If no send button found/clicked, try keyboard shortcut Ctrl+Enter as fallback
         if not send_btn:
-            raise RuntimeError("Không tìm thấy nút Send")
-        await send_btn.click()
-        await asyncio.sleep(3)
+            try:
+                await page.keyboard.down('Control')
+                await page.keyboard.press('Enter')
+                await page.keyboard.up('Control')
+            except Exception:
+                try:
+                    # Try Ctrl+M (some layouts) or just press Enter in body
+                    await page.keyboard.press('Enter')
+                except Exception:
+                    raise RuntimeError("Không tìm thấy nút Send và không thể gửi bằng phím tắt")
+
+        await asyncio.sleep(1 if fast else 3)
         try:
-            await page.wait_for_selector("div[role='status']:has-text('Sent')", timeout=5000)
+            await page.wait_for_selector("div[role='status']:has-text('Sent')", timeout=_scale_timeout(4000, fast))
         except Exception:
+            # Some layouts don't show a 'Sent' toast consistently; continue and treat as success if no exception
             pass
-        await asyncio.sleep(3)
+        await asyncio.sleep(1 if fast else 2)
         return True
     except Exception as exc:
         print(f"[Warmup] Lỗi gửi mail test: {exc}")
         return False
 
 
-async def _mark_first_mail(page) -> bool:
+async def _mark_first_mail(page, fast: bool = False) -> bool:
     try:
-        folders_to_try = ["Junk Email", "Inbox"]
+        # Only inspect Inbox for marking/read actions; ignore Junk to avoid false positives
+        folders_to_try = ["Inbox"]
         mail_selectors = [
             "div[role='option'][aria-label*='Unread']",
             "div[role='option']",
@@ -165,17 +224,42 @@ async def _mark_first_mail(page) -> bool:
                 tab = await page.query_selector(sel)
                 if tab:
                     await tab.click()
-                    await asyncio.sleep(0.8)
+                    await asyncio.sleep(0.5 if fast else 0.8)
             except Exception:
                 continue
 
         for folder in folders_to_try:
             if not await _select_folder(page, folder):
                 continue
+            # Quick check for empty-folder indicators (avoid long waits when inbox/junk is empty)
+            try:
+                await asyncio.sleep(0.3 if fast else 0.5)
+                empty_texts = [
+                    "Nothing in Junk",
+                    "Nothing in",
+                    "No messages",
+                    "Looks empty",
+                    "No messages to show",
+                ]
+                empty_found = False
+                for txt in empty_texts:
+                    try:
+                        el = await page.wait_for_selector(f"text=\"{txt}\"", timeout=_scale_timeout(900, fast))
+                        if el:
+                            empty_found = True
+                            break
+                    except Exception:
+                        continue
+                if empty_found:
+                    # skip to next folder quickly
+                    continue
+            except Exception:
+                pass
+
             mail_row = None
             for sel in mail_selectors:
                 try:
-                    mail_row = await page.wait_for_selector(sel, timeout=15000)
+                    mail_row = await page.wait_for_selector(sel, timeout=_scale_timeout(3000, fast))
                     if mail_row:
                         break
                 except Exception:
@@ -187,7 +271,7 @@ async def _mark_first_mail(page) -> bool:
             except Exception:
                 pass
             await mail_row.click()
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(0.6 if fast else 1.2)
 
             # Nếu có nút Mark as read ngay trên dòng thì click trực tiếp
             try:
@@ -197,12 +281,12 @@ async def _mark_first_mail(page) -> bool:
             if row_mark_btn:
                 try:
                     await row_mark_btn.click()
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.6 if fast else 1.0)
                     return True
                 except Exception:
                     pass
 
-            clicked = await _click_first_selector(page, mark_button_selectors, timeout=4000)
+            clicked = await _click_first_selector(page, mark_button_selectors, timeout=_scale_timeout(4000, fast), fast=fast)
             if not clicked:
                 # Phím tắt chuẩn của Outlook Web là Ctrl+Q, fallback Shift+Q
                 for shortcut in ["Control+Q", "Shift+Q"]:
@@ -212,7 +296,7 @@ async def _mark_first_mail(page) -> bool:
                         break
                     except Exception:
                         continue
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.8 if fast else 1.5)
             return clicked
         return False
     except Exception as exc:
@@ -276,10 +360,10 @@ async def _ensure_nav_open(page) -> None:
         pass
 
 
-async def _click_first_selector(page, selectors: list[str], *, timeout: int = 6000) -> bool:
+async def _click_first_selector(page, selectors: list[str], *, timeout: int = 6000, fast: bool = False) -> bool:
     for selector in selectors:
         try:
-            btn = await page.wait_for_selector(selector, timeout=timeout)
+            btn = await page.wait_for_selector(selector, timeout=_scale_timeout(timeout, fast))
             await btn.click()
             return True
         except Exception:
@@ -288,14 +372,8 @@ async def _click_first_selector(page, selectors: list[str], *, timeout: int = 60
 
 
 async def _extract_otps_from_text(text: str) -> list[str]:
-    """Find likely OTP codes in a block of text.
-
-    This looks for groups of 4-8 digits (common OTP lengths) and returns
-    unique matches in order of appearance.
-    """
     if not text:
         return []
-    # find digit groups of length 4 to 8
     matches = re.findall(r"\b(\d{4,8})\b", text)
     seen = set()
     out = []
@@ -306,23 +384,14 @@ async def _extract_otps_from_text(text: str) -> list[str]:
     return out
 
 
-async def _scan_inbox_for_otps(page, max_messages: int = 6) -> list[str]:
-    """Scan the first N messages in the inbox reading bodies for OTP-like codes.
-
-    Returns a list of discovered OTP codes (may be empty). The function is
-    defensive about selectors since Outlook UI often changes.
-    """
+async def _scan_inbox_for_otps(page, max_messages: int = 6, fast: bool = False) -> list[str]:
     otps = []
     try:
-        # Ensure we're on mail page which we usually are when called
-        await page.goto("https://outlook.live.com/mail/0/", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(1.5)
-
-        # Try to make sure Inbox is selected
+        await page.goto("https://outlook.live.com/mail/0/", wait_until="domcontentloaded", timeout=_scale_timeout(60000, fast))
+        await asyncio.sleep(0.8 if fast else 1.5)
         await _select_folder(page, "Inbox")
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.6 if fast else 1.0)
 
-        # Message list items - try some selectors and pick the visible ones
         list_selectors = [
             "div[role='option']",
             "div[role='listitem']",
@@ -342,47 +411,41 @@ async def _scan_inbox_for_otps(page, max_messages: int = 6) -> list[str]:
         if not rows:
             return []
 
-        # Limit to first max_messages rows
-        for row in rows[:max_messages]:
+        # Prefer only the newest message(s); stop after first OTP found or after checking the first message
+        for row in rows[:1]:
             try:
-                # open the message in the reading pane by clicking
                 await row.scroll_into_view_if_needed()
                 await row.click()
-                await asyncio.sleep(0.8)
-
-                # Candidate content selectors inside a opened message
+                await asyncio.sleep(0.5 if fast else 0.8)
                 content_selectors = [
                     "div[aria-label='Message body']",
                     "div[role='document']",
                     "div[aria-label*='Message body']",
-                    "div[role='main']",
                 ]
                 message_text = None
                 for sel in content_selectors:
                     try:
-                        el = await page.wait_for_selector(sel, timeout=1800)
+                        el = await page.query_selector(sel)
                         if el:
                             message_text = await el.inner_text()
                             if message_text and len(message_text) > 10:
                                 break
                     except Exception:
                         continue
-
                 if message_text:
                     found = await _extract_otps_from_text(message_text)
-                    if found:
-                        for code in found:
-                            if code not in otps:
-                                otps.append(code)
-                                print(f"[Warmup][OTP] Found OTP: {code}")
-                # small pause before next
-                await asyncio.sleep(0.4)
+                    for code in found:
+                        if code not in otps:
+                            otps.append(code)
+                            print(f"[Warmup][OTP] Found OTP: {code}")
+                    # stop after first message's OTPs to avoid junk folder noise
+                    if otps:
+                        return otps
+                await asyncio.sleep(0.2 if fast else 0.4)
             except Exception:
                 continue
-
     except Exception as exc:
         print(f"[Warmup] OTP scan failed: {exc}")
-
     return otps
 
 
@@ -392,7 +455,8 @@ async def warmup_account(
     proxy: Optional[str] = None,
     window_conf: Optional[dict] = None,
     target_email: Optional[str] = None,
-) -> tuple[bool, list[str]]:
+    fast: bool = False,
+) -> bool:
     bot = None
     browser = None
     page = None
@@ -440,56 +504,92 @@ async def warmup_account(
         except Exception:
             pass
 
-        await page.goto("https://outlook.live.com/mail/0/", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(random.uniform(3, 6))
+        await page.goto("https://outlook.live.com/mail/0/", wait_until="domcontentloaded", timeout=_scale_timeout(60000, fast))
+        await asyncio.sleep(random.uniform(1, 2) if fast else random.uniform(3, 6))
 
-        # Scan inbox for OTP codes and print them (helpful during warmup)
-        otps_before = await _scan_inbox_for_otps(page, max_messages=6)
+        # scan inbox before actions for OTPs
+        otps_before = await _scan_inbox_for_otps(page, max_messages=6, fast=fast)
+        # If OTPs already present, stop further warmup steps and proceed
         if otps_before:
-            print(f"[Warmup] OTPs found before actions for {email}: {otps_before}")
+            seen = []
+            s = set()
+            for c in otps_before:
+                if c not in s:
+                    s.add(c)
+                    seen.append(c)
+            note = "; OTPs: " + ",".join(seen)
+            update_warmup_status(
+                email,
+                status="warmed",
+                proxy=proxy,
+                note=note,
+                last_activity_at=datetime.utcnow().isoformat(),
+            )
+            print(f"[Warmup] OTP(s) already present for {email}: {seen}")
+            return True, seen
 
         results = []
         results.append(("open_inbox", True))
-        mark_success = await _mark_first_mail(page)
+        mark_success = await _mark_first_mail(page, fast=fast)
         if not mark_success:
-            await asyncio.sleep(3)
-            mark_success = await _mark_first_mail(page)
+            await asyncio.sleep(1 if fast else 3)
+            mark_success = await _mark_first_mail(page, fast=fast)
+
+        # After attempting to mark/read, scan again for OTPs and stop early if found
+        otps_after_mark = await _scan_inbox_for_otps(page, max_messages=2, fast=fast)
+        if otps_after_mark:
+            seen = []
+            s = set()
+            for c in otps_after_mark:
+                if c not in s:
+                    s.add(c)
+                    seen.append(c)
+            note = ", ".join(f"open_inbox:ok, mark_read:{'ok' if mark_success else 'fail'}") + "; OTPs: " + ",".join(seen)
+            status = "warmed"
+            update_warmup_status(
+                email,
+                status=status,
+                proxy=proxy,
+                note=note,
+                last_activity_at=datetime.utcnow().isoformat(),
+            )
+            print(f"[Warmup] Found OTP(s) after mark for {email}: {seen}")
+            return True, seen
         results.append(("mark_read", mark_success))
         recipient = target_email or email
         if mark_success:
-            await asyncio.sleep(random.uniform(2, 4))
+            await asyncio.sleep(random.uniform(1, 2) if fast else random.uniform(2, 4))
         else:
             print("[Warmup] Không đánh dấu được thư nào, vẫn tiếp tục gửi mail")
-        send_success = await _send_test_mail(page, sender=email, target=recipient)
+        send_success = await _send_test_mail(page, sender=email, target=recipient, fast=fast)
         results.append(("send_test", send_success))
-
-        # After sending a test email it's possible there are new messages with OTPs
-        otps_after = await _scan_inbox_for_otps(page, max_messages=6)
-        if otps_after:
-            print(f"[Warmup] OTPs found after actions for {email}: {otps_after}")
         print("[Warmup] Bỏ qua bước add_contact theo yêu cầu")
+
+        # scan after actions for any new OTPs
+        otps_after = await _scan_inbox_for_otps(page, max_messages=6, fast=fast)
 
         success = all(flag for _, flag in results)
         status = "warmed" if success else "warmup_failed"
         note = ", ".join(f"{name}:{'ok' if ok else 'fail'}" for name, ok in results)
-        # include any found OTP codes in the warmup note
+
+        # include discovered OTPs (deduped) in note and DB
+        otp_found = []
         try:
-            otp_found = []
             if otps_before:
                 otp_found.extend(otps_before)
             if otps_after:
                 otp_found.extend(otps_after)
-            if otp_found:
-                # dedupe while preserving order
-                seen = set()
-                order = []
-                for c in otp_found:
-                    if c not in seen:
-                        seen.add(c)
-                        order.append(c)
-                note = note + "; OTPs: " + ",".join(order)
+            seen = set()
+            ordered = []
+            for c in otp_found:
+                if c not in seen:
+                    seen.add(c)
+                    ordered.append(c)
+            if ordered:
+                note = note + "; OTPs: " + ",".join(ordered)
         except Exception:
-            pass
+            ordered = []
+
         update_warmup_status(
             email,
             status=status,
@@ -498,23 +598,7 @@ async def warmup_account(
             last_activity_at=datetime.utcnow().isoformat(),
         )
         print(f"[Warmup] Hoàn tất {email}: {note}")
-        # return success flag + list of discovered OTPs (may be empty)
-        otp_found = []
-        try:
-            if otps_before:
-                otp_found.extend(otps_before)
-            if otps_after:
-                otp_found.extend(otps_after)
-            # dedupe while preserving order
-            seen = set()
-            deduped = []
-            for c in otp_found:
-                if c not in seen:
-                    seen.add(c)
-                    deduped.append(c)
-            return success, deduped
-        except Exception:
-            return success, []
+        return success, ordered
     except Exception as exc:
         print(f"[Warmup] Lỗi với {email}: {exc}")
         update_warmup_status(email, status="warmup_failed", note=str(exc))

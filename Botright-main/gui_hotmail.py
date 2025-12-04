@@ -209,6 +209,13 @@ class MultiHotmailGUI:
         ttk.Button(warmup_proxy_frame, text="Chọn file proxy...", command=self.load_warmup_proxies).pack(side="left", padx=6)
         self.warmup_proxies_label = ttk.Label(warmup_proxy_frame, text="(0 proxy)")
         self.warmup_proxies_label.pack(side="left", padx=6)
+        # Option to ignore proxies during warmup (even if accounts have proxy saved)
+        # Default to False so warmup won't use proxies unless user enables them
+        self.use_warmup_proxies = tk.BooleanVar(value=False)
+        ttk.Checkbutton(warmup_proxy_frame, text="Sử dụng proxy khi nuôi", variable=self.use_warmup_proxies).pack(side="left", padx=8)
+        # Fast warmup mode: reduce internal waits/timeouts to speed up the process
+        self.warmup_fast = tk.BooleanVar(value=False)
+        ttk.Checkbutton(warmup_proxy_frame, text="Fast nuôi (nhanh)", variable=self.warmup_fast).pack(side="left", padx=8)
 
         ttk.Label(control, text="Lọc trạng thái:").pack(side="left", padx=(15, 4))
         self.warmup_status_filter = ttk.Combobox(control, values=["created", "warmup_failed", "warmed", "all"], width=13, state="readonly")
@@ -702,7 +709,7 @@ class MultiHotmailGUI:
         concurrency = max(1, min(3, requested_conc, len(accounts)))
 
         # If user provided warmup proxy file, assign proxies round-robin to accounts missing proxy
-        if self.warmup_proxies:
+        if self.use_warmup_proxies.get() and self.warmup_proxies:
             try:
                 with self.warmup_proxy_lock:
                     idx = self.warmup_proxy_index or 0
@@ -767,11 +774,13 @@ class MultiHotmailGUI:
                 success = False
                 note = ""
                 try:
+                    proxy_to_use = account.get("proxy") if self.use_warmup_proxies.get() else None
                     success, otps = await warmup_account(
                         account,
-                        proxy=account.get("proxy"),
+                        proxy=proxy_to_use,
                         window_conf=window_conf,
                         target_email=target_email,
+                        fast=self.warmup_fast.get(),
                     )
                 except Exception as exc:
                     note = str(exc)
